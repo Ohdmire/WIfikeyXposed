@@ -20,10 +20,15 @@ import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.graphics.Typeface;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.Process;
+import android.telephony.SubscriptionManager;
+import android.telephony.TelephonyManager;
 import android.view.ViewGroup;
 import android.view.View;
 import android.widget.LinearLayout;
@@ -99,6 +104,11 @@ public class MainHook extends XposedModule {
     /** 宿主 classLoader 与 native 库目录 — 热重载时通过 savedInstanceState 传递给新一代代码 (均为框架/boot 类加载器对象, 可安全跨代) */
     private ClassLoader hostClassLoader;
     private String hostNativeLibDir;
+    /** 宿主 Application Context — 用于查询默认数据卡/蜂窝网络状态 (ActivityThread.currentApplication 反射获取) */
+    private Context appContext;
+    /** 防止 isDataEnabled 修复逻辑在查询数据卡时递归进入自身 */
+    private static final ThreadLocal<Boolean> MOBILE_DATA_CHECKING = new ThreadLocal<>();
+    private boolean mobileDataFixLogged = false;
 
     public MainHook() {
         super();
@@ -177,6 +187,8 @@ public class MainHook extends XposedModule {
             log(4, TAG, "hookWifiSilentDelete 完成");
             hookQuickSettingsBypass(classLoader);
             log(4, TAG, "hookQuickSettingsBypass 完成");
+            hookMobileDataDetection();
+            log(4, TAG, "hookMobileDataDetection 完成");
             hookMeFragment(classLoader);
             log(4, TAG, "hookMeFragment 完成");
             log(4, TAG, "=== hook 初始化完成 ===");
@@ -1111,6 +1123,88 @@ public class MainHook extends XposedModule {
                 }
             }
         } catch (Exception ignored) {}
+    }
+
+    /**
+     * Android 17 双卡移动数据检测修复
+     *
+     * 问题: Android 17 上 TelephonyManager.isDataEnabled() 未指定 subId 时会走
+     * SubscriptionManager.getDefaultSubscriptionId() (默认语音/主卡, 如卡1),
+     * 而不是默认数据卡 (卡2)。移动数据开在卡2时, 应用检测结果恒为 false,
+     * 首页一直显示「打开移动数据, 方可加载全部免费WiFi」。
+     *
+     * 修复: 原方法返回 false 时, 再按默认数据卡 (getDefaultDataSubscriptionId)
+     * 查询一次; 仍失败则用当前活动的蜂窝网络兜底。仅在本应用进程内生效。
+     */
+    private void hookMobileDataDetection() {
+        try {
+            Method isDataEnabled = TelephonyManager.class.getDeclaredMethod("isDataEnabled");
+            hook(isDataEnabled).intercept(chain -> {
+                boolean original = Boolean.TRUE.equals(chain.proceed());
+                if (original) return true;
+                return isMobileDataActuallyEnabled((TelephonyManager) chain.getThisObject());
+            });
+            log(4, TAG, "Hooked TelephonyManager.isDataEnabled() for dual-SIM mobile data fix");
+        } catch (Throwable t) {
+            log(6, TAG, "Failed to hook TelephonyManager.isDataEnabled: " + t.getMessage());
+        }
+    }
+
+    /** 真实移动数据状态: 默认数据卡开关 或 当前活动蜂窝网络 */
+    private boolean isMobileDataActuallyEnabled(TelephonyManager baseTm) {
+        if (Boolean.TRUE.equals(MOBILE_DATA_CHECKING.get())) return false;
+        MOBILE_DATA_CHECKING.set(Boolean.TRUE);
+        try {
+            int dataSubId = SubscriptionManager.getDefaultDataSubscriptionId();
+            if (baseTm != null && dataSubId > 0) {
+                try {
+                    TelephonyManager dataTm = baseTm.createForSubscriptionId(dataSubId);
+                    if (dataTm.isDataEnabled()) {
+                        logMobileDataFix("default data sub " + dataSubId + " is enabled");
+                        return true;
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+            Context context = getHostContext();
+            if (context != null) {
+                ConnectivityManager cm = (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
+                if (cm != null) {
+                    Network active = cm.getActiveNetwork();
+                    NetworkCapabilities caps = active != null ? cm.getNetworkCapabilities(active) : null;
+                    if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
+                        logMobileDataFix("active cellular network");
+                        return true;
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            log(6, TAG, "Mobile data re-check failed: " + t.getMessage());
+        } finally {
+            MOBILE_DATA_CHECKING.remove();
+        }
+        return false;
+    }
+
+    private Context getHostContext() {
+        if (appContext != null) return appContext;
+        try {
+            Class<?> activityThread = Class.forName("android.app.ActivityThread");
+            Object application = activityThread.getMethod("currentApplication").invoke(null);
+            if (application instanceof Context) {
+                appContext = (Context) application;
+                return appContext;
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    private void logMobileDataFix(String reason) {
+        if (!mobileDataFixLogged) {
+            mobileDataFixLogged = true;
+            log(4, TAG, "Mobile data detection fixed (Android 17 dual-SIM): " + reason);
+        }
     }
 
     private void hookMeFragment(ClassLoader classLoader) {
