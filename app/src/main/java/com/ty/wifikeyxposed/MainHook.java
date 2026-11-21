@@ -185,6 +185,7 @@ public class MainHook extends XposedModule {
             log(4, TAG, "hookAntiTamper 完成");
             hookWifiSilentDelete(classLoader);
             log(4, TAG, "hookWifiSilentDelete 完成");
+            hookConnectStrategyProbe(classLoader);
             hookQuickSettingsBypass(classLoader);
             log(4, TAG, "hookQuickSettingsBypass 完成");
             hookMobileDataDetection();
@@ -1459,6 +1460,23 @@ public class MainHook extends XposedModule {
         } catch (Exception ignored) {}
     }
 
+    /** 诊断: 记录 FeatureWifi.Xr() 实际选择的连接策略 (x1/u1/w1/a2), 用于确认 WiFi 防护 hook 是否覆盖当前 Android 版本 */
+    private void hookConnectStrategyProbe(ClassLoader classLoader) {
+        try {
+            Class<?> featureWifiCls = classLoader.loadClass("com.wifitutu.link.feature.wifi.FeatureWifi");
+            Class<?> transactionCls = classLoader.loadClass("com.wifitutu.link.feature.wifi.d");
+            Method xr = featureWifiCls.getDeclaredMethod("Xr", transactionCls);
+            hook(xr).intercept(chain -> {
+                Object result = chain.proceed();
+                log(4, TAG, "Connect strategy: " + (result == null ? "null" : result.getClass().getName()));
+                return result;
+            });
+            log(4, TAG, "Hooked: FeatureWifi.Xr() strategy probe");
+        } catch (Throwable t) {
+            log(6, TAG, "Failed to hook FeatureWifi.Xr: " + t.getMessage());
+        }
+    }
+
     /**
      * 拦截 WiFi 万能钥匙静默删除网络配置的行为
      * 1. block_wifi_clear_config: 连接前静默清除 App 配置的 WiFi 网络 (Companion.a)
@@ -1496,10 +1514,27 @@ public class MainHook extends XposedModule {
                 log(6, TAG, "Failed to hook x1$a.a: " + e.getMessage());
             }
 
+            // Hook 2a: x1 构造时强制 useDeleteModel=false (final 字段, 比运行时反射改写可靠)
+            try {
+                Class<?> transactionCls = classLoader.loadClass("com.wifitutu.link.feature.wifi.d");
+                Constructor<?> x1Ctor = x1Cls.getDeclaredConstructor(transactionCls, boolean.class);
+                hook(x1Ctor).intercept(chain -> {
+                    if (isFeatureEnabled("block_wifi_delete_model", false)) {
+                        chain.getArgs().set(1, false);
+                        log(4, TAG, "Forced x1.useDeleteModel=false at construction");
+                    }
+                    return chain.proceed();
+                });
+                log(4, TAG, "Hooked: x1(d, useDeleteModel) constructor");
+            } catch (Exception e) {
+                log(6, TAG, "Failed to hook x1 constructor: " + e.getMessage());
+            }
+
             // Hook 2: 拦截 x1.f() 中的 useDeleteModel 行为
             // 该方法在连接 WiFi 时会先删除旧配置再添加新配置
             try {
-                Class<?> y2Cls = classLoader.loadClass("jz.x2");
+                // 5.2.29: 参数类型已从 jz.x2 混淆迁移为 nz.x2, 旧类名会导致 hook 失败
+                Class<?> y2Cls = classLoader.loadClass("nz.x2");
                 Class<?> wifiKeyModeCls = classLoader.loadClass("com.wifitutu.link.foundation.kernel.WIFI_KEY_MODE");
                 Method fMethod = x1Cls.getDeclaredMethod("f", y2Cls, wifiKeyModeCls);
 
@@ -1545,75 +1580,92 @@ public class MainHook extends XposedModule {
     /**
      * 绕过 QS 磁贴添加引导弹窗
      * 
-     * 拦截流程分析：
-     * 1. ConnectHandler.P() / HomeAction 调用 u3.b().Im(proc)
-     * 2. f0.Im() 检查 ku() — 如果 QS 磁贴已添加则直接 proc.invoke() 继续连接
-     * 3. 若 ku() 返回 false → 弹出 APP_QUICK_SETTINGS_GUIDE_BEFORE_CONNECT 引导弹窗
-     * 4. 弹窗回调中检查 q7$b.Gb() — 已添加则继续，否则"连接取消"
+     * 5.2.29 实际流程：
+     * 1. ConnectHandler.P() / HomeAction 在连接前调用 f0.Qj(proc)
+     * 2. f0.Qj() 检查 Np() — QS 磁贴已添加则直接 proc.invoke() 继续连接
+     * 3. 若 Np() 返回 false → 打开 APP_QUICK_SETTINGS_GUIDE_BEFORE_CONNECT 引导
      * 
      * Hook 策略：
-     * - 主 Hook: com.wifitutu.widget.qs.feature.a.ku() → 始终返回 true (跳过弹窗)
-     * - 安全网: com.wifitutu.widget.qs.mgr.a.Gb() → 始终返回 true (兜底弹窗回调)
+     * - 主 Hook: com.wifitutu.widget.qs.feature.a.Np() → 始终返回 true (跳过弹窗)
+     * - 安全网: com.wifitutu.widget.feature.f0.Qj(proc) → 直接执行连接回调
      */
     private void hookQuickSettingsBypass(ClassLoader classLoader) {
-        // 主 Hook: ku() 检查 QS 磁贴是否已添加 → 始终返回 true
+        // 主 Hook: qs.feature.a.Np() 检查 QS 磁贴是否已添加 → 始终返回 true
+        // 5.2.29 混淆后旧方法名 ku() 已不存在, 实际方法为 Np()
         try {
             Class<?> qsFeatureCls = classLoader.loadClass("com.wifitutu.widget.qs.feature.a");
-            Method kuMethod = qsFeatureCls.getDeclaredMethod("ku");
-            hook(kuMethod).intercept(chain -> {
+            Method npMethod = qsFeatureCls.getDeclaredMethod("Np");
+            hook(npMethod).intercept(chain -> {
                 if (isFeatureEnabled("bypass_qs_guide", false)) {
-                    log(4, TAG, "Bypassed QS tile check (ku) → true");
+                    log(4, TAG, "Bypassed QS tile check (Np) → true");
                     return true;
                 }
                 return chain.proceed();
             });
-            log(4, TAG, "Hooked: qs.feature.a.ku() (QS tile added check)");
+            log(4, TAG, "Hooked: qs.feature.a.Np() (QS tile added check)");
         } catch (Exception e) {
-            log(6, TAG, "Failed to hook ku(): " + e.getMessage());
+            log(6, TAG, "Failed to hook Np(): " + e.getMessage());
         }
 
-        // 安全网: qs.mgr.a.Gb() — 弹窗回调中的二次检查
+        // 安全网: widget.feature.f0.Qj(proc) — 连接前 QS 引导入口
+        // 原生在 Np() 为 false 时弹「添加功能块」引导; 此处直接执行连接回调 proc
         try {
-            Class<?> qsMgrCls = classLoader.loadClass("com.wifitutu.widget.qs.mgr.a");
-            Method gbMethod = qsMgrCls.getDeclaredMethod("Gb");
-            hook(gbMethod).intercept(chain -> {
+            Class<?> f0Cls = classLoader.loadClass("com.wifitutu.widget.feature.f0");
+            Class<?> procCls = classLoader.loadClass("od0.a");
+            Method qjMethod = f0Cls.getDeclaredMethod("Qj", procCls);
+            hook(qjMethod).intercept(chain -> {
                 if (isFeatureEnabled("bypass_qs_guide", false)) {
-                    log(4, TAG, "Bypassed QS guide check (Gb) → true");
-                    return true;
-                }
-                return chain.proceed();
-            });
-            log(4, TAG, "Hooked: qs.mgr.a.Gb() (QS guide dialog callback)");
-        } catch (Exception e) {
-            log(6, TAG, "Failed to hook Gb(): " + e.getMessage());
-        }
-
-        // 悬浮窗权限绕过: Hook permission.c.B0()，对 SYSTEM_ALERT_WINDOW 直接返回 true
-        try {
-            Class<?> permCheckerCls = classLoader.loadClass("com.wifitutu.link.foundation.kernel.permission.c");
-            Method b0Method = permCheckerCls.getMethod("B0",
-                    classLoader.loadClass("com.wifitutu.link.foundation.kernel.f6"));
-            hook(b0Method).intercept(chain -> {
-                if (isFeatureEnabled("bypass_overlay_guide", false)) {
                     try {
-                        Object f6Obj = chain.getArgs().get(0);
-                        // f6 的 target 字段存着权限 ID (混淆后字段名 "a")
-                        Field targetField = f6Obj.getClass().getDeclaredField("a");
-                        targetField.setAccessible(true);
-                        String target = (String) targetField.get(f6Obj);
-                        if ("android:system_alert_window".equals(target)) {
-                            log(4, TAG, "Spoofed B0(SYSTEM_ALERT_WINDOW) → true");
-                            return true;
-                        }
-                    } catch (Exception ex) {
-                        log(6, TAG, "B0() field access error: " + ex.getMessage());
+                        Object proc = chain.getArgs().get(0);
+                        Method invoke = procCls.getMethod("invoke");
+                        invoke.invoke(proc);
+                        log(4, TAG, "Bypassed QS before-connect guide (Qj) → continue connect");
+                        return true;
+                    } catch (Throwable t) {
+                        log(6, TAG, "Qj proc invoke failed: " + t.getMessage());
                     }
                 }
                 return chain.proceed();
             });
-            log(4, TAG, "Hooked: permission.c.B0() (overlay permission bypass)");
+            log(4, TAG, "Hooked: widget.feature.f0.Qj() (QS before-connect guide)");
         } catch (Exception e) {
-            log(6, TAG, "Failed to hook permission.c.B0(): " + e.getMessage());
+            log(6, TAG, "Failed to hook f0.Qj(): " + e.getMessage());
+        }
+
+        // 悬浮窗权限绕过: 5.2.29 的权限检查入口是 permission.c.m(String)
+        // 旧 B0(f6) 已不存在; 对 android:system_alert_window 直接返回 true
+        try {
+            Class<?> permCheckerCls = classLoader.loadClass("com.wifitutu.link.foundation.kernel.permission.c");
+            Method checkMethod = permCheckerCls.getMethod("m", String.class);
+            hook(checkMethod).intercept(chain -> {
+                if (isFeatureEnabled("bypass_overlay_guide", false)
+                        && "android:system_alert_window".equals(chain.getArgs().get(0))) {
+                    log(4, TAG, "Spoofed overlay permission check (m) → true");
+                    return true;
+                }
+                return chain.proceed();
+            });
+            log(4, TAG, "Hooked: permission.c.m(String) (overlay permission bypass)");
+        } catch (Exception e) {
+            log(6, TAG, "Failed to hook permission.c.m: " + e.getMessage());
+        }
+
+        // s0(h6) 权限组检查走 Companion.c(String, Context), 同样放行悬浮窗权限
+        try {
+            // Kotlin Companion 在 5.2.29 混淆为 c$a, 不是 c$Companion
+            Class<?> companionCls = classLoader.loadClass("com.wifitutu.link.foundation.kernel.permission.c$a");
+            Method cMethod = companionCls.getDeclaredMethod("c", String.class, Context.class);
+            hook(cMethod).intercept(chain -> {
+                if (isFeatureEnabled("bypass_overlay_guide", false)
+                        && "android:system_alert_window".equals(chain.getArgs().get(0))) {
+                    log(4, TAG, "Spoofed overlay group permission check (Companion.c) → true");
+                    return true;
+                }
+                return chain.proceed();
+            });
+            log(4, TAG, "Hooked: permission.c$a.c(String, Context) (overlay group bypass)");
+        } catch (Exception e) {
+            log(6, TAG, "Failed to hook permission c$a.c: " + e.getMessage());
         }
     }
 

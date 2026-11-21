@@ -2,7 +2,7 @@
 
 WiFi万能钥匙 5.2.29 的 Xposed 模块，提供本地 SVIP 永久解锁、全模块去广告、底栏/工具栏精简、WiFi 防护等功能。
 
-[![Latest Release](https://img.shields.io/badge/最新版本-v1.6.0-blue)](https://github.com/TYOPXN360/WIfikeyXposed/releases/latest)
+[![Latest Release](https://img.shields.io/badge/最新版本-v1.6.1-blue)](https://github.com/TYOPXN360/WIfikeyXposed/releases/latest)
 [![Downloads](https://img.shields.io/badge/平台-Android_11%2B-green)](https://github.com/TYOPXN360/WIfikeyXposed/releases)
 
 ## ⚠️ 代码生成说明
@@ -35,10 +35,10 @@ WiFi万能钥匙 5.2.29 的 Xposed 模块，提供本地 SVIP 永久解锁、全
 - **跳过 QS 磁贴引导**：连接 WiFi 时跳过「添加快速设置磁贴」引导弹窗
 - **跳过悬浮窗权限引导**：连接 WiFi 时跳过「授予悬浮窗权限」引导弹窗
 
-### WiFi 防护（⚠️ 实验性功能，可能不生效）
-- **阻止连接前清除网络**：拦截连接 WiFi 前静默删除 App 自建网络配置的行为
-- **阻止先删后加模式**：拦截连接时先删除旧配置再添加新配置的 useDeleteModel 行为
-- **阻止失败后清理配置**：拦截连接失败后静默清理 WiFi 网络配置的行为
+### WiFi 防护（⚠️ 实验性功能）
+- **阻止连接前清除网络**：拦截连接 WiFi 前静默删除 App 自建网络配置的行为（对所有连接策略生效）
+- **阻止先删后加模式**：拦截连接时先删除旧配置再添加新配置的 useDeleteModel 行为（仅传统 x1 连接策略；Android 17 上 App 多数走 u1/a2 建议网络策略，本身不执行删除）
+- **阻止失败后清理配置**：拦截连接失败后静默清理 WiFi 网络配置的行为（仅传统 x1 连接策略）
 
 ### 防篡改绕过
 - **绕过防篡改检测**：屏蔽 APK 完整性校验，允许安全修改数据层
@@ -95,6 +95,13 @@ WIfikeyXposed/
 - WiFi 防护功能为实验性功能，可能不完全生效
 
 ## 更新日志
+
+### v1.6.1
+- 修复 Android 17 双卡机型「移动数据已打开但 App 检测不到」：`TelephonyManager.isDataEnabled()` 默认按主卡（默认语音卡）查询，改为按默认数据卡复查并增加蜂窝网络兜底
+- 修复「跳过 QS 磁贴引导」在 5.2.29 失效：旧 `ku()/Gb()` 方法已混淆改名，改挂 `qs.feature.a.Np()` + `feature.f0.Qj(proc)`
+- 修复「跳过悬浮窗权限引导」在 5.2.29 失效：旧 `permission.c.B0(f6)` 已不存在，改挂 `permission.c.m(String)`，仅对 `android:system_alert_window` 返回 true
+- 修复 WiFi 防护「阻止先删后加模式」hook 失败：参数类型 `jz.x2` 已迁移为 `nz.x2`，并在 `x1` 构造期强制 `useDeleteModel=false`
+- 新增连接策略诊断日志（`FeatureWifi.Xr()` → x1/u1/w1/a2），便于确认 WiFi 防护是否覆盖当前系统策略
 
 ### v1.6.0
 - libxposed API 升级至 102：支持热重载，设置页新增「热重载模块 (免重启)」按钮
